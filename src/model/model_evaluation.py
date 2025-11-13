@@ -1,5 +1,4 @@
-# updated model evaluation
-
+# model_evaluation.py (updated)
 import numpy as np
 import pandas as pd
 import pickle
@@ -10,21 +9,11 @@ import mlflow
 import mlflow.sklearn
 import dagshub
 import os
-
-# Set up DagsHub credentials for MLflow tracking
-dagshub_token = os.getenv("DAGSHUB_PAT")
-if not dagshub_token:
-    raise EnvironmentError("DAGSHUB_PAT environment variable is not set")
-
-os.environ["MLFLOW_TRACKING_USERNAME"] = dagshub_token
-os.environ["MLFLOW_TRACKING_PASSWORD"] = dagshub_token
-
-dagshub_url = "https://dagshub.com"
-repo_owner = "sudarshansahane1044"
-repo_name = "emotion_detection_project_.mlflow"
+from datetime import datetime
 
 # Set up MLflow tracking URI
-mlflow.set_tracking_uri(f'{dagshub_url}/{repo_owner}/{repo_name}.mlflow')
+mlflow.set_tracking_uri('https://dagshub.com/sudarshansahane1044/emotion_detection_project_.mlflow')
+dagshub.init(repo_owner='sudarshansahane1044', repo_name='emotion_detection_project_', mlflow=True)
 
 # logging configuration
 logger = logging.getLogger('model_evaluation')
@@ -40,8 +29,17 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(messag
 console_handler.setFormatter(formatter)
 file_handler.setFormatter(formatter)
 
-logger.addHandler(console_handler)
-logger.addHandler(file_handler)
+# Avoid duplicate handlers if script is imported multiple times
+if not logger.handlers:
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+else:
+    # ensure handlers exist and set levels/formatters
+    logger.handlers = [console_handler, file_handler]
+
+def ensure_reports_dir():
+    os.makedirs('reports', exist_ok=True)
+    logger.debug('Ensured reports/ directory exists')
 
 def load_model(file_path: str):
     """Load the trained model from a file."""
@@ -74,20 +72,41 @@ def evaluate_model(clf, X_test: np.ndarray, y_test: np.ndarray) -> dict:
     """Evaluate the model and return the evaluation metrics."""
     try:
         y_pred = clf.predict(X_test)
-        y_pred_proba = clf.predict_proba(X_test)[:, 1]
+
+        # If classifier supports predict_proba, use the positive class probability for AUC.
+        if hasattr(clf, 'predict_proba'):
+            try:
+                y_pred_proba = clf.predict_proba(X_test)[:, 1]
+            except Exception:
+                # if predict_proba exists but fails (e.g., single-class), fallback to predictions
+                y_pred_proba = y_pred
+                logger.warning('predict_proba failed; falling back to deterministic predictions for AUC')
+        elif hasattr(clf, 'decision_function'):
+            try:
+                y_pred_proba = clf.decision_function(X_test)
+            except Exception:
+                y_pred_proba = y_pred
+                logger.warning('decision_function failed; falling back to deterministic predictions for AUC')
+        else:
+            y_pred_proba = y_pred
+            logger.warning('Classifier has no predict_proba/decision_function; using discrete predictions for AUC (may be degenerate)')
 
         accuracy = accuracy_score(y_test, y_pred)
-        precision = precision_score(y_test, y_pred)
-        recall = recall_score(y_test, y_pred)
-        auc = roc_auc_score(y_test, y_pred_proba)
+        precision = precision_score(y_test, y_pred, zero_division=0)
+        recall = recall_score(y_test, y_pred, zero_division=0)
+        try:
+            auc = roc_auc_score(y_test, y_pred_proba)
+        except Exception as e:
+            logger.warning('AUC calculation failed: %s. Setting auc to 0.0', e)
+            auc = 0.0
 
         metrics_dict = {
-            'accuracy': accuracy,
-            'precision': precision,
-            'recall': recall,
-            'auc': auc
+            'accuracy': float(accuracy),
+            'precision': float(precision),
+            'recall': float(recall),
+            'auc': float(auc)
         }
-        logger.debug('Model evaluation metrics calculated')
+        logger.debug('Model evaluation metrics calculated: %s', metrics_dict)
         return metrics_dict
     except Exception as e:
         logger.error('Error during model evaluation: %s', e)
@@ -106,7 +125,11 @@ def save_metrics(metrics: dict, file_path: str) -> None:
 def save_model_info(run_id: str, model_path: str, file_path: str) -> None:
     """Save the model run ID and path to a JSON file."""
     try:
-        model_info = {'run_id': run_id, 'model_path': model_path}
+        model_info = {
+            'run_id': run_id,
+            'model_path': model_path,
+            'saved_at': datetime.utcnow().isoformat() + 'Z'
+        }
         with open(file_path, 'w') as file:
             json.dump(model_info, file, indent=4)
         logger.debug('Model info saved to %s', file_path)
@@ -115,6 +138,7 @@ def save_model_info(run_id: str, model_path: str, file_path: str) -> None:
         raise
 
 def main():
+    ensure_reports_dir()
     mlflow.set_experiment("dvc-pipeline")
     with mlflow.start_run() as run:  # Start an MLflow run
         try:
@@ -126,32 +150,52 @@ def main():
 
             metrics = evaluate_model(clf, X_test, y_test)
             
-            save_metrics(metrics, 'reports/metrics.json')
+            metrics_path = 'reports/metrics.json'
+            info_path = 'reports/experiment_info.json'
+
+            save_metrics(metrics, metrics_path)
             
             # Log metrics to MLflow
             for metric_name, metric_value in metrics.items():
                 mlflow.log_metric(metric_name, metric_value)
             
-            # Log model parameters to MLflow
+            # Log model parameters to MLflow (if any)
             if hasattr(clf, 'get_params'):
-                params = clf.get_params()
-                for param_name, param_value in params.items():
-                    mlflow.log_param(param_name, param_value)
+                try:
+                    params = clf.get_params()
+                    for param_name, param_value in params.items():
+                        # mlflow requires param values to be str/int/float
+                        mlflow.log_param(param_name, str(param_value))
+                except Exception as e:
+                    logger.warning('Failed to log model params: %s', e)
             
             # Log model to MLflow
-            mlflow.sklearn.log_model(clf, "model")
-            
-            # Save model info
-            save_model_info(run.info.run_id, "model", 'reports/experiment_info.json')
-            
-            # Log the metrics file to MLflow
-            mlflow.log_artifact('reports/metrics.json')
+            try:
+                mlflow.sklearn.log_model(clf, "model")
+            except Exception as e:
+                logger.warning('Failed to log model to MLflow: %s', e)
 
-            # Log the model info file to MLflow
-            mlflow.log_artifact('reports/model_info.json')
+            # Save model info (this is the file DVC expects)
+            save_model_info(run.info.run_id, "model", info_path)
+            
+            # Log the metrics file and experiment info file to MLflow
+            try:
+                mlflow.log_artifact(metrics_path)
+            except Exception as e:
+                logger.warning('Failed to log metrics artifact: %s', e)
+            try:
+                mlflow.log_artifact(info_path)
+            except Exception as e:
+                logger.warning('Failed to log experiment info artifact: %s', e)
 
-            # Log the evaluation errors log file to MLflow
-            mlflow.log_artifact('model_evaluation_errors.log')
+            # Log the evaluation errors log file to MLflow (optional)
+            if os.path.exists('model_evaluation_errors.log'):
+                try:
+                    mlflow.log_artifact('model_evaluation_errors.log')
+                except Exception as e:
+                    logger.warning('Failed to log evaluation errors log: %s', e)
+
+            logger.info('Model evaluation completed successfully for run_id=%s', run.info.run_id)
         except Exception as e:
             logger.error('Failed to complete the model evaluation process: %s', e)
             print(f"Error: {e}")
