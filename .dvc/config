@@ -1,4 +1,4 @@
 [core]
-    remote = myremote
-['remote "myremote"']
-    url = C:\Users\sudar\AppData\Local\Temp
+    remote = azure_remote
+['remote "azure_remote"']
+    url = azure://emotiondvc/emotiondata
