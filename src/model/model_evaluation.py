@@ -1,9 +1,11 @@
-# model_evaluation.py (updated)
+# model_evaluation.py (updated to save & log artifacts: .pkl, mlflow model, .yaml, .mlmodel, requirements.txt)
 import numpy as np
 import pandas as pd
 import pickle
 import json
-from sklearn.metrics import accuracy_score, precision_score, recall_score, roc_auc_score
+import glob
+import subprocess
+import sys
 import logging
 import mlflow
 import mlflow.sklearn
@@ -137,6 +139,44 @@ def save_model_info(run_id: str, model_path: str, file_path: str) -> None:
         logger.error('Error occurred while saving the model info: %s', e)
         raise
 
+def generate_requirements(path: str):
+    """Generate requirements.txt using pip freeze and save to path."""
+    try:
+        # Use the same Python executable that runs the script
+        reqs = subprocess.check_output([sys.executable, '-m', 'pip', 'freeze'], stderr=subprocess.STDOUT)
+        with open(path, 'wb') as f:
+            f.write(reqs)
+        logger.debug('requirements.txt generated at %s', path)
+    except Exception as e:
+        logger.warning('Failed to generate requirements.txt: %s', e)
+
+def log_matching_files(patterns, base_exclude_dirs=None):
+    """
+    Log files matching glob patterns to MLflow.
+    patterns: list of glob patterns (supports recursive with **)
+    base_exclude_dirs: list of directory names to exclude (simple substring check)
+    """
+    base_exclude_dirs = base_exclude_dirs or ['venv', 'env', '.venv', 'myenv', 'site-packages', '__pycache__']
+    for pat in patterns:
+        for fp in glob.glob(pat, recursive=True):
+            try:
+                # quick exclude check
+                if any(ex in fp for ex in base_exclude_dirs):
+                    logger.debug('Skipping file (excluded dir): %s', fp)
+                    continue
+                if os.path.isdir(fp):
+                    # Log directory as artifacts
+                    mlflow.log_artifacts(fp)
+                    logger.debug('Logged artifact directory: %s', fp)
+                else:
+                    mlflow.log_artifact(fp)
+                    logger.debug('Logged artifact file: %s', fp)
+            except Exception as e:
+                logger.warning('Failed to log artifact %s: %s', fp, e)
+
+# Add the sklearn metric imports here (keeps function definitions above clear)
+from sklearn.metrics import accuracy_score, precision_score, recall_score, roc_auc_score
+
 def main():
     ensure_reports_dir()
     mlflow.set_experiment("dvc-pipeline")
@@ -169,11 +209,41 @@ def main():
                 except Exception as e:
                     logger.warning('Failed to log model params: %s', e)
             
-            # Log model to MLflow
+            # Log model to MLflow (this creates the MLmodel metadata)
             try:
                 mlflow.sklearn.log_model(clf, "model")
+                logger.debug('Model logged to MLflow via mlflow.sklearn.log_model')
             except Exception as e:
                 logger.warning('Failed to log model to MLflow: %s', e)
+            
+            # --- EXTRA: Save a plain pickle of the model in reports/ and log it ---
+            try:
+                pkl_path = 'reports/model.pkl'
+                with open(pkl_path, 'wb') as f:
+                    pickle.dump(clf, f)
+                mlflow.log_artifact(pkl_path)
+                logger.debug('Pickle model saved and logged: %s', pkl_path)
+            except Exception as e:
+                logger.warning('Failed to save/log pickle model: %s', e)
+
+            # --- EXTRA: Save an MLflow model folder under reports and log the entire folder ---
+            try:
+                mlflow.sklearn.save_model(clf, path='reports/mlflow_model')
+                # log entire model folder as artifacts
+                mlflow.log_artifacts('reports/mlflow_model')
+                logger.debug('Saved and logged MLflow model folder at reports/mlflow_model')
+            except Exception as e:
+                logger.warning('Failed to save/log mlflow model folder: %s', e)
+
+            # --- EXTRA: Generate and log requirements.txt ---
+            try:
+                reqs_path = 'reports/requirements.txt'
+                generate_requirements(reqs_path)
+                if os.path.exists(reqs_path):
+                    mlflow.log_artifact(reqs_path)
+                    logger.debug('requirements.txt logged to MLflow: %s', reqs_path)
+            except Exception as e:
+                logger.warning('Failed to generate/log requirements.txt: %s', e)
 
             # Save model info (this is the file DVC expects)
             save_model_info(run.info.run_id, "model", info_path)
@@ -187,6 +257,23 @@ def main():
                 mlflow.log_artifact(info_path)
             except Exception as e:
                 logger.warning('Failed to log experiment info artifact: %s', e)
+
+            # Log other matching artifacts if present in the repository:
+            # - any yaml/yml files (e.g., conda env, model config),
+            # - any .mlmodel (CoreML) files,
+            # - any additional .pkl files (e.g., vectorizers),
+            # - optionally requirements (already logged).
+            try:
+                patterns = [
+                    '**/*.yaml',
+                    '**/*.yml',
+                    '**/*.mlmodel',
+                    'models/**/*.pkl',
+                    '**/requirements.txt'
+                ]
+                log_matching_files(patterns)
+            except Exception as e:
+                logger.warning('Failed during extra artifact scanning/logging: %s', e)
 
             # Log the evaluation errors log file to MLflow (optional)
             if os.path.exists('model_evaluation_errors.log'):
